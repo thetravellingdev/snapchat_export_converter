@@ -109,25 +109,50 @@ def find_voice_memos():
                     # Create output path with mp3 extension
                     output_path = file.with_suffix('.mp3')
                     
-                    # Convert to mp3
-                    subprocess.run([
+                    # Extract date from filename
+                    date = extract_date_from_filename(file.name)
+                    date_str = date.strftime("%Y-%m-%d %H:%M:%S") if date else None
+                    
+                    # Build ffmpeg command with metadata
+                    ffmpeg_cmd = [
                         'ffmpeg',
                         '-i', str(file),
                         '-vn',  # No video
                         '-acodec', 'libmp3lame',  # Use MP3 codec
-                        '-q:a', '2',  # High quality
+                        '-q:a', '2'  # High quality
+                    ]
+                    
+                    # Add metadata if we have a date
+                    if date_str:
+                        ffmpeg_cmd.extend([
+                            '-metadata', f'creation_time={date_str}',
+                            '-metadata', f'date={date_str}'
+                        ])
+                    
+                    # Add output path and overwrite flag
+                    ffmpeg_cmd.extend([
                         str(output_path),
                         '-y',  # Overwrite if exists
                         '-loglevel', 'error'
-                    ], check=True)
+                    ])
+                    
+                    # Convert to mp3
+                    subprocess.run(ffmpeg_cmd, check=True)
                     
                     # Set permissions and timestamps on new file
                     os.chmod(str(output_path), stat.S_IRUSR | stat.S_IWUSR)
-                    file_stat = os.stat(str(file))
-                    os.utime(str(output_path), (file_stat.st_atime, file_stat.st_mtime))
+                    
+                    # Set file timestamps
+                    if date:
+                        timestamp = time.mktime(date.timetuple())
+                        os.utime(str(output_path), (timestamp, timestamp))
+                    else:
+                        # If no date in filename, copy timestamps from original
+                        file_stat = os.stat(str(file))
+                        os.utime(str(output_path), (file_stat.st_atime, file_stat.st_mtime))
                     
                     # Remove original mp4
-                    os.remove(str(file))  # Using os.remove instead of Path.unlink()
+                    os.remove(str(file))
                     
                     voice_memos.append(output_path)
                     
@@ -401,6 +426,8 @@ def process_video_overlays():
                 # Build ffmpeg command based on audio presence
                 ffmpeg_cmd = [
                     'ffmpeg',
+                    '-hide_banner',
+                    '-loglevel', 'error',
                     '-i', str(original_path),
                     '-i', str(overlay_path),
                     '-metadata', f'creation_time={date_str}',
@@ -416,8 +443,7 @@ def process_video_overlays():
 
                 ffmpeg_cmd.extend([
                     str(with_overlay_path),
-                    '-y',
-                    '-loglevel', 'error'
+                    '-y'
                 ])
 
                 subprocess.run(ffmpeg_cmd, check=True)
@@ -660,8 +686,9 @@ def update_image_metadata(file_path):
         # Convert date to EXIF format
         exif_date = date.strftime("%Y:%m:%d %H:%M:%S")
         
-        # Read existing EXIF
+        # Read existing EXIF and image
         img = Image.open(file_path)
+        
         try:
             exif_dict = piexif.load(img.info.get('exif', b''))
         except:
@@ -669,15 +696,29 @@ def update_image_metadata(file_path):
         
         # Add date if not present
         if piexif.ImageIFD.DateTime not in exif_dict['0th']:
-            exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
+            exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date.encode('utf-8')
         if piexif.ExifIFD.DateTimeOriginal not in exif_dict['Exif']:
-            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
+            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date.encode('utf-8')
         if piexif.ExifIFD.DateTimeDigitized not in exif_dict['Exif']:
-            exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = exif_date
+            exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = exif_date.encode('utf-8')
             
         # Save updated EXIF
         exif_bytes = piexif.dump(exif_dict)
-        img.save(file_path, exif=exif_bytes)
+        
+        # Handle RGBA images for JPEG
+        if file_path.suffix.lower() in ['.jpg', '.jpeg']:
+            if img.mode == 'RGBA':
+                # Create white background
+                background = Image.new('RGB', img.size, 'WHITE')
+                # Paste using alpha channel
+                background.paste(img, mask=img.split()[3])
+                # Save with EXIF
+                background.save(file_path, 'JPEG', exif=exif_bytes)
+            else:
+                img.save(file_path, exif=exif_bytes)
+        else:
+            # For non-JPEG images
+            img.save(file_path, exif=exif_bytes)
         
         # Update file timestamps
         timestamp = time.mktime(date.timetuple())
@@ -714,6 +755,8 @@ def update_video_metadata(file_path):
             # Add creation date
             subprocess.run([
                 'ffmpeg',
+                '-hide_banner',
+                '-loglevel', 'error',
                 '-i', str(file_path),
                 '-metadata', f'creation_time={date.strftime("%Y-%m-%d %H:%M:%S")}',
                 '-c', 'copy',
