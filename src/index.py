@@ -10,7 +10,7 @@ import subprocess
 import piexif
 import os
 import time
-import datetime
+from datetime import datetime
 
 logging.basicConfig(
     level=logging.INFO,
@@ -178,7 +178,7 @@ def get_exif_date(exif_dict):
         if ifd in exif_dict and tag in exif_dict[ifd]:
             try:
                 date_str = exif_dict[ifd][tag].decode('utf-8')
-                dates.append(datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S'))
+                dates.append(datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S'))
             except:
                 continue
     
@@ -357,7 +357,7 @@ def get_video_creation_date(file_path):
         if 'format' in metadata and 'tags' in metadata['format']:
             tags = metadata['format']['tags']
             if 'creation_time' in tags:
-                return datetime.datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
+                return datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
     except:
         pass
     return None
@@ -410,7 +410,7 @@ def process_video_overlays():
                 main_path.rename(original_path)
                 
                 # Get creation dates
-                filename_date = datetime.datetime.strptime(original_path.name.split('_')[0], '%Y-%m-%d')
+                filename_date = datetime.strptime(original_path.name.split('_')[0], '%Y-%m-%d')
                 video_date = get_video_creation_date(original_path)
                 
                 # Use the older date
@@ -530,7 +530,7 @@ def score_metadata(metadata):
             tags = metadata['video_metadata']['format']['tags']
             if 'creation_time' in tags:
                 try:
-                    video_date = datetime.datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
+                    video_date = datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
                     dates.append(video_date)
                 except:
                     pass
@@ -606,8 +606,6 @@ def remove_duplicates():
                 logging.error(f"Failed to remove {file_path}: {e}")
     
     logging.info(f"Removed {len(to_delete)} duplicate files")
-    if to_delete:
-        logging.info("Kept files with oldest metadata")
 
 def remove_unwanted_files():
     """Remove all files except webp, png, jpeg, jpg, and mp4."""
@@ -679,10 +677,9 @@ def remove_empty_folders():
 
 def extract_date_from_filename(filename):
     """Extract date from filename format like '2023-11-22_UUID'."""
-    import datetime
-    date_str = filename.split('_')[0]
     try:
-        return datetime.datetime.strptime(date_str, '%Y-%m-%d')
+        date_str = filename.split('_')[0]
+        return datetime.strptime(date_str, '%Y-%m-%d')
     except ValueError:
         return None
 
@@ -766,7 +763,7 @@ def update_video_metadata(file_path):
         existing_date = None
         if 'format' in metadata and 'tags' in metadata['format'] and 'creation_time' in metadata['format']['tags']:
             try:
-                existing_date = datetime.strptime(metadata['format']['tags']['creation_time'], '%Y-%m-%d %H:%M:%S')
+                existing_date = datetime.strptime(metadata['format']['tags']['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
             except ValueError:
                 pass
                 
