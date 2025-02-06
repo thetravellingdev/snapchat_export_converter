@@ -173,14 +173,17 @@ def get_exif_date(exif_dict):
         ('0th', piexif.ImageIFD.DateTime)
     ]
     
+    dates = []
     for ifd, tag in date_tags:
         if ifd in exif_dict and tag in exif_dict[ifd]:
             try:
                 date_str = exif_dict[ifd][tag].decode('utf-8')
-                return datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S')
+                dates.append(datetime.datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S'))
             except:
                 continue
-    return None
+    
+    # Return oldest date if any found
+    return min(dates) if dates else None
 
 def merge_exif_data(main_exif, overlay_exif):
     """Merge EXIF data, preferring older dates."""
@@ -473,7 +476,8 @@ def get_file_metadata(file_path):
         'creation_time': file_path.stat().st_ctime,
         'modification_time': file_path.stat().st_mtime,
         'exif_data': None,
-        'video_metadata': None
+        'video_metadata': None,
+        'filename_date': extract_date_from_filename(file_path.name)
     }
     
     # Handle images
@@ -506,28 +510,38 @@ def get_file_metadata(file_path):
     return metadata
 
 def score_metadata(metadata):
-    """Score metadata completeness. Higher score means more complete metadata."""
+    """Score metadata completeness and age. Lower score means older/better metadata."""
     score = 0
+    dates = []
     
-    # Basic file timestamps
-    if metadata['creation_time']:
-        score += 1
-    if metadata['modification_time']:
-        score += 1
+    # Get filename date
+    if metadata['filename_date']:
+        dates.append(metadata['filename_date'])
     
-    # EXIF data for images
+    # Get EXIF dates for images
     if metadata['exif_data']:
-        # Add points for each EXIF section that contains data
-        for section in ['0th', 'Exif', 'GPS', '1st']:
-            if section in metadata['exif_data'] and metadata['exif_data'][section]:
-                score += 2
+        exif_date = get_exif_date(metadata['exif_data'])
+        if exif_date:
+            dates.append(exif_date)
     
-    # Video metadata
+    # Get video creation date
     if metadata['video_metadata']:
-        if 'format' in metadata['video_metadata']:
-            score += 2
-        if 'streams' in metadata['video_metadata']:
-            score += len(metadata['video_metadata']['streams'])
+        if 'format' in metadata['video_metadata'] and 'tags' in metadata['video_metadata']['format']:
+            tags = metadata['video_metadata']['format']['tags']
+            if 'creation_time' in tags:
+                try:
+                    video_date = datetime.datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
+                    dates.append(video_date)
+                except:
+                    pass
+    
+    # Use the oldest date for scoring
+    if dates:
+        oldest_date = min(dates)
+        score = oldest_date.timestamp()
+    else:
+        # If no dates found, use file system dates
+        score = min(metadata['creation_time'], metadata['modification_time'])
     
     return score
 
@@ -567,13 +581,13 @@ def remove_duplicates():
     
     with tqdm(duplicate_groups, desc="Processing duplicates", unit="group", ncols=80) as pbar:
         for group in pbar:
-            # Score each file's metadata
+            # Score each file's metadata (lower score = older/better)
             scored_files = [(f, m, score_metadata(m)) for f, m in group]
             
-            # Sort by metadata score (highest first), then by modification time (newest first)
-            scored_files.sort(key=lambda x: (-x[2], -x[1]['modification_time']))
+            # Sort by metadata score (lowest/oldest first)
+            scored_files.sort(key=lambda x: x[2])
             
-            # Keep the first (best) file, mark others for deletion
+            # Keep the first (oldest) file, mark others for deletion
             to_delete.extend(f for f, _, _ in scored_files[1:])
             
             pbar.set_description(f"Found {len(to_delete)} duplicates")
@@ -593,7 +607,7 @@ def remove_duplicates():
     
     logging.info(f"Removed {len(to_delete)} duplicate files")
     if to_delete:
-        logging.info("Kept files with best metadata quality and newest timestamps")
+        logging.info("Kept files with oldest metadata")
 
 def remove_unwanted_files():
     """Remove all files except webp, png, jpeg, jpg, and mp4."""
@@ -694,35 +708,36 @@ def update_image_metadata(file_path):
         except:
             exif_dict = {'0th':{}, 'Exif':{}, 'GPS':{}, '1st':{}, 'thumbnail':None}
         
-        # Add date if not present
-        if piexif.ImageIFD.DateTime not in exif_dict['0th']:
+        # Get existing dates
+        existing_date = get_exif_date(exif_dict)
+        
+        # Only update if filename date is older or no existing date
+        if not existing_date or date < existing_date:
             exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date.encode('utf-8')
-        if piexif.ExifIFD.DateTimeOriginal not in exif_dict['Exif']:
             exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date.encode('utf-8')
-        if piexif.ExifIFD.DateTimeDigitized not in exif_dict['Exif']:
             exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = exif_date.encode('utf-8')
             
-        # Save updated EXIF
-        exif_bytes = piexif.dump(exif_dict)
-        
-        # Handle RGBA images for JPEG
-        if file_path.suffix.lower() in ['.jpg', '.jpeg']:
-            if img.mode == 'RGBA':
-                # Create white background
-                background = Image.new('RGB', img.size, 'WHITE')
-                # Paste using alpha channel
-                background.paste(img, mask=img.split()[3])
-                # Save with EXIF
-                background.save(file_path, 'JPEG', exif=exif_bytes)
+            # Save updated EXIF
+            exif_bytes = piexif.dump(exif_dict)
+            
+            # Handle RGBA images for JPEG
+            if file_path.suffix.lower() in ['.jpg', '.jpeg']:
+                if img.mode == 'RGBA':
+                    # Create white background
+                    background = Image.new('RGB', img.size, 'WHITE')
+                    # Paste using alpha channel
+                    background.paste(img, mask=img.split()[3])
+                    # Save with EXIF
+                    background.save(file_path, 'JPEG', exif=exif_bytes)
+                else:
+                    img.save(file_path, exif=exif_bytes)
             else:
+                # For non-JPEG images
                 img.save(file_path, exif=exif_bytes)
-        else:
-            # For non-JPEG images
-            img.save(file_path, exif=exif_bytes)
-        
-        # Update file timestamps
-        timestamp = time.mktime(date.timetuple())
-        os.utime(file_path, (timestamp, timestamp))
+            
+            # Update file timestamps
+            timestamp = time.mktime(date.timetuple())
+            os.utime(file_path, (timestamp, timestamp))
         
     except Exception as e:
         logging.error(f"Failed to update image metadata for {file_path}: {e}")
@@ -747,6 +762,10 @@ def update_video_metadata(file_path):
         
         metadata = json.loads(result.stdout)
         
+        # Get existing date
+        existing_date = None
+        if 'format' in metadata and 'tags' in metadata['format'] and 'creation_time' in metadata['format']['tags']:
+            try:
         # Only update if creation_time not present
         if 'format' not in metadata or 'tags' not in metadata['format'] or 'creation_time' not in metadata['format']['tags']:
             # Create temporary file
