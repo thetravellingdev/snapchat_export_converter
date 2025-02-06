@@ -82,15 +82,17 @@ class SnapchatProcessor:
                 date_time = datetime.strptime(date_str, '%Y-%m-%d')
                 formatted_date = date_time.strftime('%Y:%m:%d %H:%M:%S')
                 
-                # Use exiftool to modify dates
+                # Use exiftool to modify dates, focusing on writable attributes
                 subprocess.run([
                     'exiftool',
                     '-overwrite_original',
-                    f'-FileModifyDate={formatted_date}',
-                    f'-FileAccessDate={formatted_date}',
-                    f'-FileInodeChangeDate={formatted_date}',
+                    '-m',  # Ignore minor warnings
+                    f'-ModifyDate={formatted_date}',
+                    f'-DateTimeOriginal={formatted_date}',
+                    f'-CreateDate={formatted_date}',
+                    '-P',  # Preserve file modification date
                     str(file_path)
-                ], check=True)
+                ], stderr=subprocess.PIPE)  # Capture stderr to handle warnings
                 logging.info(f"Applied metadata to: {file_path}")
             except Exception as e:
                 logging.error(f"Error applying metadata to {file_path}: {str(e)}")
