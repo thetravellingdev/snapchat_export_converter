@@ -834,7 +834,7 @@ def reorganize_files():
                     
                 # Get creation date from filename
                 date_str = file_path.name.split('_')[0]
-                creation_date = datetime.datetime.strptime(date_str, '%Y-%m-%d')
+                creation_date = datetime.strptime(date_str, '%Y-%m-%d')
                 
                 files_with_metadata.append((file_path, folder_name, creation_date))
             except Exception as e:
