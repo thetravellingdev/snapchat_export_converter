@@ -1,3 +1,3 @@
-media*
-zips*
-tmp*
+media/*
+zips/*
+tmp
