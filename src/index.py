@@ -1,920 +1,227 @@
 #!/usr/bin/env python3
 
-import json
-from PIL import Image
-from pathlib import Path
-import zipfile
-from tqdm import tqdm
-import logging
-import subprocess
-import piexif
 import os
-import time
+import shutil
+import zipfile
+import logging
+import re
 from datetime import datetime
+from pathlib import Path
+import subprocess
+from PIL import Image
+import uuid
+import ffmpeg
 
+# Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(message)s',
-    datefmt='%H:%M:%S'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('snapchat_processor.log'),
+        logging.StreamHandler()
+    ]
 )
 
-def extract_snapchat_data():
-    """Extract Snapchat data zip files to tmp directory."""
-    root = Path(__file__).parent.parent
-    zip_dir = root / 'zips'
-    tmp_dir = root / 'tmp'
-    
-    # Create tmp dir if it doesn't exist
-    tmp_dir.mkdir(exist_ok=True)
-    
-    # Get list of zip files
-    zip_files = list(zip_dir.glob('My Data*.zip'))
-    
-    if not zip_files:
-        logging.error("No zip files found")
-        return
-    
-    # Count total files across all zips
-    total_files = 0
-    for zip_path in zip_files:
-        with zipfile.ZipFile(zip_path) as zip_ref:
-            total_files += len(zip_ref.namelist())
-    
-    # Extract with progress bar
-    with tqdm(total=total_files, unit="file", ncols=80) as pbar:
-        for zip_path in zip_files:
-            logging.info(f"Processing {zip_path.name}")
-            try:
-                with zipfile.ZipFile(zip_path) as zip_ref:
-                    # Update progress for each file in the zip
-                    for file in zip_ref.namelist():
-                        zip_ref.extract(file, tmp_dir)
-                        pbar.update(1)
-                        pbar.set_description(f"Extracting {Path(file).name[:30]}")
-            except Exception as e:
-                logging.error(f"Failed to extract {zip_path.name}: {e}")
-
-def remove_thumbnails():
-    """Remove all thumbnail files from tmp directory."""
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    
-    # Find all thumbnail files
-    thumbnail_files = list(tmp_dir.rglob('*thumbnail*'))
-    
-    if not thumbnail_files:
-        logging.info("No thumbnail files found")
-        return
-    
-    # Remove thumbnails with progress bar
-    with tqdm(thumbnail_files, unit="file", ncols=80) as pbar:
-        for thumb_file in pbar:
-            pbar.set_description(f"Removing {thumb_file.name[:30]}")
-            try:
-                thumb_file.unlink()
-            except Exception as e:
-                logging.error(f"Failed to remove {thumb_file}: {e}")
-    
-    logging.info(f"Removed {len(thumbnail_files)} thumbnail files")
-
-def find_voice_memos():
-    """Find mp4 files that are voice memos and convert them to mp3."""
-    import os
-    import stat
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    
-    # Find all mp4 files
-    mp4_files = list(tmp_dir.rglob('*.mp4'))
-    voice_memos = []
-    
-    with tqdm(mp4_files, unit="file", ncols=80) as pbar:
-        for file in pbar:
-            pbar.set_description(f"Checking {file.name[:30]}")
-            try:
-                # Make file fully writable for owner
-                os.chmod(str(file), stat.S_IRUSR | stat.S_IWUSR)
-                
-                # Run ffprobe to check for video streams
-                result = subprocess.run([
-                    'ffprobe',
-                    '-i', str(file),
-                    '-show_streams',
-                    '-select_streams', 'v',
-                    '-loglevel', 'error'
-                ], capture_output=True, text=True)
-                
-                # If there's no output, it's a voice memo
-                if not result.stdout.strip():
-                    # Create output path with mp3 extension
-                    output_path = file.with_suffix('.mp3')
-                    
-                    # Extract date from filename
-                    date = extract_date_from_filename(file.name)
-                    date_str = date.strftime("%Y-%m-%d %H:%M:%S") if date else None
-                    
-                    # Build ffmpeg command with metadata
-                    ffmpeg_cmd = [
-                        'ffmpeg',
-                        '-i', str(file),
-                        '-vn',  # No video
-                        '-acodec', 'libmp3lame',  # Use MP3 codec
-                        '-q:a', '2'  # High quality
-                    ]
-                    
-                    # Add metadata if we have a date
-                    if date_str:
-                        ffmpeg_cmd.extend([
-                            '-metadata', f'creation_time={date_str}',
-                            '-metadata', f'date={date_str}'
-                        ])
-                    
-                    # Add output path and overwrite flag
-                    ffmpeg_cmd.extend([
-                        str(output_path),
-                        '-y',  # Overwrite if exists
-                        '-loglevel', 'error'
-                    ])
-                    
-                    # Convert to mp3
-                    subprocess.run(ffmpeg_cmd, check=True)
-                    
-                    # Set permissions and timestamps on new file
-                    os.chmod(str(output_path), stat.S_IRUSR | stat.S_IWUSR)
-                    
-                    # Set file timestamps
-                    if date:
-                        timestamp = time.mktime(date.timetuple())
-                        os.utime(str(output_path), (timestamp, timestamp))
-                    else:
-                        # If no date in filename, copy timestamps from original
-                        file_stat = os.stat(str(file))
-                        os.utime(str(output_path), (file_stat.st_atime, file_stat.st_mtime))
-                    
-                    # Remove original mp4
-                    os.remove(str(file))
-                    
-                    voice_memos.append(output_path)
-                    
-            except Exception as e:
-                logging.error(f"Failed to process {file}: {e}")
-    
-    logging.info(f"Converted {len(voice_memos)} voice memos to MP3")
-
-def get_exif_date(exif_dict):
-    """Extract date from EXIF data, return None if not found."""
-    if not exif_dict:
-        return None
+class SnapchatProcessor:
+    def __init__(self, zip_dir="zips", tmp_dir="tmp", media_dir="media"):
+        self.zip_dir = Path(zip_dir)
+        self.tmp_dir = Path(tmp_dir)
+        self.media_dir = Path(media_dir)
+        self.supported_extensions = {'.mp4', '.jpg', '.jpeg', '.png', '.webp'}
         
-    # Try to get date from different EXIF tags
-    date_tags = [
-        ('Exif', piexif.ExifIFD.DateTimeOriginal),
-        ('Exif', piexif.ExifIFD.DateTimeDigitized),
-        ('0th', piexif.ImageIFD.DateTime)
-    ]
-    
-    dates = []
-    for ifd, tag in date_tags:
-        if ifd in exif_dict and tag in exif_dict[ifd]:
-            try:
-                date_str = exif_dict[ifd][tag].decode('utf-8')
-                dates.append(datetime.strptime(date_str, '%Y:%m:%d %H:%M:%S'))
-            except:
-                continue
-    
-    # Return oldest date if any found
-    return min(dates) if dates else None
+    def setup_directories(self):
+        """Create necessary directories if they don't exist."""
+        for directory in [self.tmp_dir, self.media_dir]:
+            directory.mkdir(exist_ok=True)
+            logging.info(f"Ensured directory exists: {directory}")
 
-def merge_exif_data(main_exif, overlay_exif):
-    """Merge EXIF data, preferring older dates."""
-    final_exif = main_exif if main_exif else {'0th':{}, 'Exif':{}, 'GPS':{}, '1st':{}, 'thumbnail':None}
-    
-    if not overlay_exif:
-        return final_exif
-        
-    # Get dates from both images
-    main_date = get_exif_date(main_exif)
-    overlay_date = get_exif_date(overlay_exif)
-    
-    # Determine which date to use (prefer older)
-    use_overlay_date = False
-    if main_date and overlay_date:
-        use_overlay_date = overlay_date < main_date
-    elif overlay_date:
-        use_overlay_date = True
-    
-    # Update EXIF data
-    if use_overlay_date:
-        # Use overlay's date tags
-        for ifd in ('0th', 'Exif'):
-            if ifd in overlay_exif:
-                date_tags = [
-                    piexif.ImageIFD.DateTime if ifd == '0th' else None,
-                    piexif.ExifIFD.DateTimeOriginal if ifd == 'Exif' else None,
-                    piexif.ExifIFD.DateTimeDigitized if ifd == 'Exif' else None
-                ]
-                date_tags = [tag for tag in date_tags if tag]
-                for tag in date_tags:
-                    if tag in overlay_exif[ifd]:
-                        if ifd not in final_exif:
-                            final_exif[ifd] = {}
-                        final_exif[ifd][tag] = overlay_exif[ifd][tag]
-    
-    # Merge other metadata (non-date)
-    for ifd in ('0th', 'Exif', 'GPS', '1st'):
-        if ifd in overlay_exif and overlay_exif[ifd]:
-            if ifd not in final_exif:
-                final_exif[ifd] = {}
-            # Only copy non-date tags
-            for tag, value in overlay_exif[ifd].items():
-                if tag not in [piexif.ImageIFD.DateTime, 
-                             piexif.ExifIFD.DateTimeOriginal,
-                             piexif.ExifIFD.DateTimeDigitized]:
-                    final_exif[ifd][tag] = value
-    
-    return final_exif
-
-def process_image_overlays():
-    """Find and process image files with overlays, renaming appropriately."""
-    import re
-    from PIL import Image
-    import piexif
-    
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    overlays = {}
-    mains = {}
-    
-    # Regular expression for UUID
-    uuid_pattern = r'[0-9A-Fa-f-]{36}'
-    
-    # Find all files and categorize them
-    for file in tmp_dir.rglob('*'):
-        if not file.is_file():
-            continue
-            
-        match = re.search(uuid_pattern, str(file))
-        if not match:
-            continue
-            
-        uuid = match.group()
-        if '-overlay.' in file.name:
-            overlays[uuid] = file
-        elif '-main.' in file.name and file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-            mains[uuid] = file
-    
-    # Process pairs with progress bar
-    pairs = [(uuid, main, overlays[uuid]) 
-             for uuid, main in mains.items() 
-             if uuid in overlays]
-    
-    with tqdm(pairs, unit="image", ncols=80) as pbar:
-        for uuid, main_path, overlay_path in pbar:
-            try:
-                pbar.set_description(f"Processing {main_path.name[:30]}")
-                
-                # Prepare output paths
-                base_path = main_path.parent / main_path.name.replace('-main', '')
-                original_path = base_path.with_name(base_path.stem + '-original' + main_path.suffix)
-                with_overlay_path = base_path.with_name(base_path.stem + '-with-overlay' + main_path.suffix)
-                
-                # Copy original
-                main_path.rename(original_path)
-                
-                # Load images and their EXIF data
-                main_img = Image.open(original_path)
-                overlay_img = Image.open(overlay_path)
-                
-                # Get EXIF data
-                main_exif = None
-                overlay_exif = None
-                try:
-                    main_exif = piexif.load(main_img.info.get('exif', b''))
-                except:
-                    pass
-                try:
-                    overlay_exif = piexif.load(overlay_img.info.get('exif', b''))
-                except:
-                    pass
-                
-                # Merge EXIF data (prefer older dates)
-                final_exif = merge_exif_data(main_exif, overlay_exif)
-                
-                # Resize overlay if needed
-                if main_img.size != overlay_img.size:
-                    overlay_img = overlay_img.resize(main_img.size)
-                
-                # Composite images
-                result = Image.alpha_composite(main_img.convert('RGBA'), overlay_img)
-                
-                # Convert back to RGB for JPEG
-                if with_overlay_path.suffix.lower() in ['.jpg', '.jpeg']:
-                    # Create white background
-                    background = Image.new('RGB', result.size, 'WHITE')
-                    # Paste using alpha channel
-                    background.paste(result, mask=result.split()[3])
-                    
-                    # Save with EXIF
-                    if final_exif:
-                        try:
-                            exif_bytes = piexif.dump(final_exif)
-                            background.save(with_overlay_path, 'JPEG', exif=exif_bytes)
-                        except:
-                            background.save(with_overlay_path, 'JPEG')
-                    else:
-                        background.save(with_overlay_path, 'JPEG')
-                else:
-                    # Save PNG with EXIF if available
-                    if final_exif:
-                        try:
-                            exif_bytes = piexif.dump(final_exif)
-                            result.save(with_overlay_path, exif=exif_bytes)
-                        except:
-                            result.save(with_overlay_path)
-                    else:
-                        result.save(with_overlay_path)
-                
-                # Remove overlay file
-                overlay_path.unlink()
-                
-            except Exception as e:
-                logging.error(f"Failed to process {main_path}: {e}")
-    
-    logging.info(f"Processed {len(pairs)} image pairs")
-
-def get_video_creation_date(file_path):
-    """Extract creation date from video metadata."""
-    try:
-        result = subprocess.run([
-            'ffprobe',
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_format',
-            str(file_path)
-        ], capture_output=True, text=True)
-        
-        metadata = json.loads(result.stdout)
-        if 'format' in metadata and 'tags' in metadata['format']:
-            tags = metadata['format']['tags']
-            if 'creation_time' in tags:
-                return datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
-    except:
-        pass
-    return None
-
-def process_video_overlays():
-    """Find and process video files with overlays using ffmpeg."""
-    import re
-    import subprocess
-    import json
-    
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    overlays = {}
-    mains = {}
-    
-    # Regular expression for UUID
-    uuid_pattern = r'[0-9A-Fa-f-]{36}'
-    
-    # Find all files and categorize them
-    for file in tmp_dir.rglob('*'):
-        if not file.is_file():
-            continue
-            
-        match = re.search(uuid_pattern, str(file))
-        if not match:
-            continue
-            
-        uuid = match.group()
-        if '-overlay.' in file.name and file.suffix.lower() == '.png':
-            overlays[uuid] = file
-        elif '-main.' in file.name and file.suffix.lower() == '.mp4':
-            mains[uuid] = file
-    
-    # Process pairs with progress bar
-    pairs = [(uuid, main, overlays[uuid]) 
-             for uuid, main in mains.items() 
-             if uuid in overlays]
-    
-    with tqdm(pairs, unit="video", ncols=80) as pbar:
-        for uuid, main_path, overlay_path in pbar:
-            try:
-                pbar.set_description(f"Processing {main_path.name[:30]}")
-                
-                # Prepare output paths
-                base_path = main_path.parent / main_path.name.replace('-main', '')
-                original_path = base_path.with_name(base_path.stem + '-original.mp4')
-                with_overlay_path = base_path.with_name(base_path.stem + '-with-overlay.mp4')
-                
-                # Rename original
-                main_path.rename(original_path)
-                
-                # Get creation dates
-                filename_date = datetime.strptime(original_path.name.split('_')[0], '%Y-%m-%d')
-                video_date = get_video_creation_date(original_path)
-                
-                # Use the older date
-                final_date = min([d for d in [filename_date, video_date] if d is not None])
-                date_str = final_date.strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Check if video has audio stream
-                has_audio = subprocess.run([
-                    'ffprobe',
-                    '-i', str(original_path),
-                    '-show_streams',
-                    '-select_streams', 'a',
-                    '-loglevel', 'error'
-                ], capture_output=True, text=True).stdout.strip()
-
-                # Build ffmpeg command based on audio presence
-                ffmpeg_cmd = [
-                    'ffmpeg',
-                    '-hide_banner',
-                    '-loglevel', 'error',
-                    '-i', str(original_path),
-                    '-i', str(overlay_path),
-                    '-metadata', f'creation_time={date_str}',
-                    '-filter_complex', '[0:v][1:v]overlay=0:0',
-                    '-movflags', '+faststart'
-                ]
-
-                if has_audio:
-                    ffmpeg_cmd.extend([
-                        '-c:a', 'copy',
-                        '-map_metadata:s:a', '0:s:a'
-                    ])
-
-                ffmpeg_cmd.extend([
-                    str(with_overlay_path),
-                    '-y'
-                ])
-
-                subprocess.run(ffmpeg_cmd, check=True)
-                
-                # Set file system timestamps to match
-                timestamp = final_date.timestamp()
-                os.utime(with_overlay_path, (timestamp, timestamp))
-                os.utime(original_path, (timestamp, timestamp))
-                
-                # Remove overlay file
-                overlay_path.unlink()
-                
-            except subprocess.CalledProcessError as e:
-                logging.error(f"FFmpeg failed for {main_path}: {e}")
-            except Exception as e:
-                logging.error(f"Failed to process {main_path}: {e}")
-    
-    logging.info(f"Processed {len(pairs)} video pairs")
-
-def get_file_metadata(file_path):
-    """Extract metadata from image or video file."""
-    import json
-    from PIL import Image
-    import piexif
-    
-    metadata = {
-        'creation_time': file_path.stat().st_ctime,
-        'modification_time': file_path.stat().st_mtime,
-        'exif_data': None,
-        'video_metadata': None,
-        'filename_date': extract_date_from_filename(file_path.name)
-    }
-    
-    # Handle images
-    if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
+    def extract_files(self):
+        """Extract supported files from zip archives."""
         try:
-            with Image.open(file_path) as img:
-                if 'exif' in img.info:
-                    metadata['exif_data'] = piexif.load(img.info['exif'])
+            for zip_file in self.zip_dir.glob('*.zip'):
+                logging.info(f"Processing zip file: {zip_file}")
+                with zipfile.ZipFile(zip_file) as zf:
+                    for file_info in zf.infolist():
+                        if any(file_info.filename.lower().endswith(ext) for ext in self.supported_extensions):
+                            if 'thumbnail' not in file_info.filename.lower():
+                                zf.extract(file_info, self.tmp_dir)
+                                logging.info(f"Extracted: {file_info.filename}")
         except Exception as e:
-            logging.error(f"Failed to extract EXIF from {file_path}: {e}")
-    
-    # Handle videos
-    elif file_path.suffix.lower() == '.mp4':
+            logging.error(f"Error during extraction: {str(e)}")
+            raise
+
+    def process_html_files(self):
+        """Process files from the HTML folder with proper renaming."""
+        html_dir = self.tmp_dir / 'html'
         try:
-            # Get video metadata using ffprobe
-            result = subprocess.run([
-                'ffprobe',
-                '-v', 'quiet',
-                '-print_format', 'json',
-                '-show_format',
-                '-show_streams',
-                str(file_path)
-            ], capture_output=True, text=True)
-            
-            if result.stdout:
-                metadata['video_metadata'] = json.loads(result.stdout)
+            if html_dir.exists():
+                for folder in html_dir.iterdir():
+                    if folder.is_dir():
+                        for file in folder.glob('*.*'):
+                            if file.suffix.lower() in self.supported_extensions:
+                                new_name = f"{folder.name}{file.suffix.lower()}"
+                                shutil.copy2(file, self.media_dir / new_name)
+                                logging.info(f"Processed HTML file: {file} -> {new_name}")
         except Exception as e:
-            logging.error(f"Failed to extract video metadata from {file_path}: {e}")
-    
-    return metadata
+            logging.error(f"Error processing HTML files: {str(e)}")
+            raise
 
-def score_metadata(metadata):
-    """Score metadata completeness and age. Lower score means older/better metadata."""
-    score = 0
-    dates = []
-    
-    # Get filename date
-    if metadata['filename_date']:
-        dates.append(metadata['filename_date'])
-    
-    # Get EXIF dates for images
-    if metadata['exif_data']:
-        exif_date = get_exif_date(metadata['exif_data'])
-        if exif_date:
-            dates.append(exif_date)
-    
-    # Get video creation date
-    if metadata['video_metadata']:
-        if 'format' in metadata['video_metadata'] and 'tags' in metadata['video_metadata']['format']:
-            tags = metadata['video_metadata']['format']['tags']
-            if 'creation_time' in tags:
-                try:
-                    video_date = datetime.strptime(tags['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
-                    dates.append(video_date)
-                except:
-                    pass
-    
-    # Use the oldest date for scoring
-    if dates:
-        oldest_date = min(dates)
-        score = oldest_date.timestamp()
-    else:
-        # If no dates found, use file system dates
-        score = min(metadata['creation_time'], metadata['modification_time'])
-    
-    return score
-
-def remove_duplicates():
-    """Find and remove duplicate files while preserving the best metadata."""
-    import hashlib
-    from collections import defaultdict
-    
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    hash_dict = defaultdict(list)
-    
-    # First pass: Calculate hashes and gather metadata
-    all_files = list(tmp_dir.rglob('*'))
-    files = [f for f in all_files if f.is_file()]
-    
-    with tqdm(files, desc="Analyzing files", unit="file", ncols=80) as pbar:
-        for file_path in pbar:
-            pbar.set_description(f"Analyzing {file_path.name[:30]}")
-            try:
-                # Calculate SHA-256 hash in chunks
-                sha256_hash = hashlib.sha256()
-                with open(file_path, "rb") as f:
-                    for byte_block in iter(lambda: f.read(4096), b""):
-                        sha256_hash.update(byte_block)
-                
-                # Store both file path and its metadata
-                metadata = get_file_metadata(file_path)
-                hash_dict[sha256_hash.hexdigest()].append((file_path, metadata))
-                
-            except Exception as e:
-                logging.error(f"Failed to analyze {file_path}: {e}")
-    
-    # Find duplicates and determine which to keep
-    to_delete = []
-    duplicate_groups = [files for files in hash_dict.values() if len(files) > 1]
-    
-    with tqdm(duplicate_groups, desc="Processing duplicates", unit="group", ncols=80) as pbar:
-        for group in pbar:
-            # Score each file's metadata (lower score = older/better)
-            scored_files = [(f, m, score_metadata(m)) for f, m in group]
-            
-            # Sort by metadata score (lowest/oldest first)
-            scored_files.sort(key=lambda x: x[2])
-            
-            # Keep the first (oldest) file, mark others for deletion
-            to_delete.extend(f for f, _, _ in scored_files[1:])
-            
-            pbar.set_description(f"Found {len(to_delete)} duplicates")
-    
-    # Remove duplicates with progress bar
-    if not to_delete:
-        logging.info("No duplicates found")
-        return
-    
-    with tqdm(to_delete, desc="Removing duplicates", unit="file", ncols=80) as pbar:
-        for file_path in pbar:
-            pbar.set_description(f"Removing {file_path.name[:30]}")
-            try:
-                file_path.unlink()
-            except Exception as e:
-                logging.error(f"Failed to remove {file_path}: {e}")
-    
-    logging.info(f"Removed {len(to_delete)} duplicate files")
-
-def remove_unwanted_files():
-    """Remove all files except webp, png, jpeg, jpg, and mp4."""
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    
-    # Define allowed extensions
-    allowed_extensions = {'.webp', '.png', '.jpeg', '.jpg', '.mp4'}
-    
-    # Get all files that aren't in allowed extensions
-    files = [f for f in tmp_dir.rglob('*') 
-             if f.is_file() and f.suffix.lower() not in allowed_extensions]
-    
-    if not files:
-        logging.info("No unwanted files found")
-        return
-    
-    with tqdm(files, desc="Removing unwanted files", unit="file", ncols=80) as pbar:
-        for file_path in pbar:
-            pbar.set_description(f"Removing {file_path.name[:30]}")
-            try:
-                file_path.unlink()
-            except Exception as e:
-                logging.error(f"Failed to remove {file_path}: {e}")
-    
-    logging.info(f"Removed {len(files)} unwanted files")
-
-def remove_empty_folders():
-    """Remove all empty folders recursively."""
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    
-    # First count all directories for progress bar
-    all_dirs = [d for d in tmp_dir.rglob('*') if d.is_dir()]
-    
-    if not all_dirs:
-        logging.info("No directories found")
-        return
-    
-    with tqdm(total=len(all_dirs), desc="Removing empty folders", unit="folder", ncols=80) as pbar:
-        # Keep going until we can't remove any more empty dirs
-        while True:
-            empty_dirs = []
-            
-            # Find all empty directories
-            for dir_path in tmp_dir.rglob('*'):
-                if dir_path.is_dir():
-                    try:
-                        # Check if directory is empty or only contains empty directories
-                        contents = list(dir_path.iterdir())
-                        if not contents:
-                            empty_dirs.append(dir_path)
-                    except Exception as e:
-                        logging.error(f"Failed to check {dir_path}: {e}")
-            
-            if not empty_dirs:
-                break
-                
-            # Remove empty directories
-            for dir_path in empty_dirs:
-                try:
-                    dir_path.rmdir()
-                    pbar.update(1)
-                    pbar.set_description(f"Removed {dir_path.name[:30]}")
-                except Exception as e:
-                    logging.error(f"Failed to remove {dir_path}: {e}")
-    
-    logging.info("Empty folder removal complete")
-
-def extract_date_from_filename(filename):
-    """Extract date from filename format like '2023-11-22_UUID'."""
-    try:
-        date_str = filename.split('_')[0]
-        return datetime.strptime(date_str, '%Y-%m-%d')
-    except ValueError:
+    def _extract_date_from_filename(self, filename):
+        """Extract date from filename pattern."""
+        date_pattern = r'(\d{4}-\d{2}-\d{2})'
+        match = re.search(date_pattern, filename)
+        if match:
+            return match.group(1)
         return None
 
-def update_image_metadata(file_path):
-    """Update image metadata with creation date from filename if not present."""
-    from PIL import Image
-    import piexif
-    import time
-    
-    date = extract_date_from_filename(file_path.name)
-    if not date:
-        return
-    
-    try:
-        # Convert date to EXIF format
-        exif_date = date.strftime("%Y:%m:%d %H:%M:%S")
-        
-        # Read existing EXIF and image
-        img = Image.open(file_path)
-        
+    def apply_metadata(self, file_path):
+        """Apply metadata based on filename date."""
+        date_str = self._extract_date_from_filename(file_path.name)
+        if date_str:
+            try:
+                date_time = datetime.strptime(date_str, '%Y-%m-%d')
+                formatted_date = date_time.strftime('%Y:%m:%d %H:%M:%S')
+                
+                # Use exiftool to modify dates
+                subprocess.run([
+                    'exiftool',
+                    '-overwrite_original',
+                    f'-FileModifyDate={formatted_date}',
+                    f'-FileAccessDate={formatted_date}',
+                    f'-FileInodeChangeDate={formatted_date}',
+                    str(file_path)
+                ], check=True)
+                logging.info(f"Applied metadata to: {file_path}")
+            except Exception as e:
+                logging.error(f"Error applying metadata to {file_path}: {str(e)}")
+
+    def apply_overlay(self, main_file, overlay_file, output_file):
+        """Apply overlay to main file."""
         try:
-            exif_dict = piexif.load(img.info.get('exif', b''))
-        except:
-            exif_dict = {'0th':{}, 'Exif':{}, 'GPS':{}, '1st':{}, 'thumbnail':None}
-        
-        # Get existing dates
-        existing_date = get_exif_date(exif_dict)
-        
-        # Only update if filename date is older or no existing date
-        if not existing_date or date < existing_date:
-            exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date.encode('utf-8')
-            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date.encode('utf-8')
-            exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = exif_date.encode('utf-8')
-            
-            # Save updated EXIF
-            exif_bytes = piexif.dump(exif_dict)
-            
-            # Handle RGBA images for JPEG
-            if file_path.suffix.lower() in ['.jpg', '.jpeg']:
-                if img.mode == 'RGBA':
-                    # Create white background
-                    background = Image.new('RGB', img.size, 'WHITE')
-                    # Paste using alpha channel
-                    background.paste(img, mask=img.split()[3])
-                    # Save with EXIF
-                    background.save(file_path, 'JPEG', exif=exif_bytes)
-                else:
-                    img.save(file_path, exif=exif_bytes)
-            else:
-                # For non-JPEG images
-                img.save(file_path, exif=exif_bytes)
-            
-            # Update file timestamps
-            timestamp = time.mktime(date.timetuple())
-            os.utime(file_path, (timestamp, timestamp))
-        
-    except Exception as e:
-        logging.error(f"Failed to update image metadata for {file_path}: {e}")
-
-def update_video_metadata(file_path):
-    """Update video metadata with creation date from filename if not present."""
-    import json
-    
-    date = extract_date_from_filename(file_path.name)
-    if not date:
-        return
-        
-    try:
-        # Check existing metadata
-        result = subprocess.run([
-            'ffprobe',
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_format',
-            str(file_path)
-        ], capture_output=True, text=True)
-        
-        metadata = json.loads(result.stdout)
-        
-        # Get existing date
-        existing_date = None
-        if 'format' in metadata and 'tags' in metadata['format'] and 'creation_time' in metadata['format']['tags']:
-            try:
-                existing_date = datetime.strptime(metadata['format']['tags']['creation_time'].split('.')[0], '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                pass
+            if main_file.suffix.lower() in {'.jpg', '.jpeg', '.png', '.webp'}:
+                # Process image
+                with Image.open(main_file) as base:
+                    with Image.open(overlay_file) as overlay:
+                        # Resize overlay to match base image size
+                        overlay = overlay.resize(base.size)
+                        # Convert images to RGBA if they aren't already
+                        if base.mode != 'RGBA':
+                            base = base.convert('RGBA')
+                        if overlay.mode != 'RGBA':
+                            overlay = overlay.convert('RGBA')
+                        # Composite the images
+                        result = Image.alpha_composite(base, overlay)
+                        result.save(output_file)
+            elif main_file.suffix.lower() == '.mp4':
+                # Process video using ffmpeg
+                overlay_path = str(overlay_file)
+                main_input = ffmpeg.input(str(main_file))
+                overlay_input = ffmpeg.input(overlay_path)
                 
-        # Only update if creation_time not present
-        if 'format' not in metadata or 'tags' not in metadata['format'] or 'creation_time' not in metadata['format']['tags']:
-            # Create temporary file
-            temp_path = file_path.with_name(file_path.stem + '_temp' + file_path.suffix)
+                ffmpeg.filter(
+                    [main_input, overlay_input],
+                    'overlay',
+                    'overlay'
+                ).output(
+                    str(output_file)
+                ).overwrite_output().run()
             
-            # Add creation date
-            subprocess.run([
-                'ffmpeg',
-                '-hide_banner',
-                '-loglevel', 'error',
-                '-i', str(file_path),
-                '-metadata', f'creation_time={date.strftime("%Y-%m-%d %H:%M:%S")}',
-                '-c', 'copy',
-                str(temp_path),
-                '-y'
-            ], check=True)
+            logging.info(f"Applied overlay: {main_file} + {overlay_file} -> {output_file}")
+        except Exception as e:
+            logging.error(f"Error applying overlay: {str(e)}")
+            raise
+
+    def process_memories(self):
+        """Process memories folder, applying overlays where applicable."""
+        memories_dir = self.tmp_dir / 'memories'
+        try:
+            if memories_dir.exists():
+                # Group files by their UUID
+                files_by_uuid = {}
+                for file in memories_dir.iterdir():
+                    if file.is_file():
+                        # Extract UUID from filename
+                        uuid_match = re.search(r'(\d{4}-\d{2}-\d{2})_([^-]+)', file.name)
+                        if uuid_match:
+                            date, file_uuid = uuid_match.groups()
+                            if file_uuid not in files_by_uuid:
+                                files_by_uuid[file_uuid] = {'date': date, 'files': []}
+                            files_by_uuid[file_uuid]['files'].append(file)
+
+                # Process each group
+                for file_uuid, group in files_by_uuid.items():
+                    main_file = next((f for f in group['files'] if 'main' in f.name), None)
+                    overlay_file = next((f for f in group['files'] if 'overlay' in f.name), None)
+
+                    if main_file and overlay_file:
+                        # Handle original file
+                        original_name = main_file.name.replace('-main', '-original')
+                        original_path = self.media_dir / original_name
+                        
+                        # Copy with appropriate metadata handling
+                        if main_file.suffix.lower() == '.mp4':
+                            # For videos, use ffmpeg to copy while preserving metadata
+                            ffmpeg.input(str(main_file)).output(
+                                str(original_path),
+                                codec='copy',
+                                map_metadata=0
+                            ).overwrite_output().run()
+                        else:
+                            # For images, copy and apply date-based metadata
+                            shutil.copy2(main_file, original_path)
+                            self.apply_metadata(original_path)
+
+                        # Create overlaid version
+                        overlay_name = main_file.name.replace('-main', '-with-overlay')
+                        overlay_path = self.media_dir / overlay_name
+                        
+                        # Apply overlay with metadata handling
+                        self.apply_overlay(
+                            main_file,
+                            overlay_file,
+                            overlay_path
+                        )
+                        
+                        # Handle metadata for overlaid version
+                        if main_file.suffix.lower() == '.mp4':
+                            # Extract metadata from original video and apply to overlaid version
+                            subprocess.run([
+                                'exiftool',
+                                '-overwrite_original',
+                                f'-tagsFromFile',
+                                str(main_file),
+                                str(overlay_path)
+                            ], check=True)
+                        else:
+                            # For images, apply date-based metadata
+                            self.apply_metadata(overlay_path)
+                        
+                        logging.info(f"Processed memory pair: {main_file.name}")
+        except Exception as e:
+            logging.error(f"Error processing memories: {str(e)}")
+            raise
+
+    def process_all(self):
+        """Run the complete processing pipeline."""
+        try:
+            logging.info("Starting Snapchat data processing")
+            self.setup_directories()
+            self.extract_files()
+            self.process_html_files()
             
-            # Replace original with updated file
-            temp_path.replace(file_path)
+            # Process files with date-based metadata
+            for file in self.tmp_dir.rglob('*.*'):
+                if file.suffix.lower() in self.supported_extensions:
+                    if 'thumbnail' not in file.name.lower():
+                        shutil.copy2(file, self.media_dir)
+                        self.apply_metadata(self.media_dir / file.name)
             
-            # Update file timestamps
-            timestamp = time.mktime(date.timetuple())
-            os.utime(file_path, (timestamp, timestamp))
-            
-    except Exception as e:
-        logging.error(f"Failed to update video metadata for {file_path}: {e}")
-
-def update_all_metadata():
-    """Update metadata for all media files using dates from filenames."""
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    
-    # Find all media files
-    media_files = []
-    for ext in ['.jpg', '.jpeg', '.png', '.webp', '.mp4']:
-        media_files.extend(tmp_dir.rglob(f'*{ext}'))
-    
-    with tqdm(media_files, unit="file", ncols=80) as pbar:
-        for file_path in pbar:
-            pbar.set_description(f"Updating metadata: {file_path.name[:30]}")
-            
-            if file_path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.webp']:
-                update_image_metadata(file_path)
-            elif file_path.suffix.lower() == '.mp4':
-                update_video_metadata(file_path)
-
-def reorganize_files():
-    """Move all files to media folder, named by original folder and sorted by date."""
-    root = Path(__file__).parent.parent
-    tmp_dir = root / 'tmp'
-    media_dir = root / 'media'
-    
-    # Create media directory
-    media_dir.mkdir(exist_ok=True)
-    
-    # Get all media files and their metadata
-    files_with_metadata = []
-    for ext in ['.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mp3']:
-        for file_path in tmp_dir.rglob(f'*{ext}'):
-            try:
-                # Get original folder name
-                folder_name = file_path.parent.name.lower()
-                if folder_name == 'tmp':  # Skip root tmp folder
-                    continue
-                    
-                # Get creation date from filename
-                date_str = file_path.name.split('_')[0]
-                creation_date = datetime.strptime(date_str, '%Y-%m-%d')
-                
-                files_with_metadata.append((file_path, folder_name, creation_date))
-            except Exception as e:
-                logging.error(f"Failed to process metadata for {file_path}: {e}")
-    
-    # Sort by folder name and creation date
-    files_with_metadata.sort(key=lambda x: (x[1], x[2]))
-    
-    # Group by folder for separate counters
-    folder_counters = {}
-    
-    with tqdm(files_with_metadata, unit="file", ncols=80) as pbar:
-        for file_path, folder_name, _ in pbar:
-            try:
-                pbar.set_description(f"Moving {file_path.name[:30]}")
-                
-                # Initialize counter for new folders
-                if folder_name not in folder_counters:
-                    folder_counters[folder_name] = 1
-                
-                # Create new filename
-                new_name = f"{folder_name}_{folder_counters[folder_name]}{file_path.suffix.lower()}"
-                new_path = media_dir / new_name
-                
-                # Increment counter for this folder
-                folder_counters[folder_name] += 1
-                
-                # Move file
-                file_path.rename(new_path)
-                
-            except Exception as e:
-                logging.error(f"Failed to move {file_path}: {e}")
-    
-    # Log summary
-    for folder, count in folder_counters.items():
-        logging.info(f"Moved {count-1} files from {folder}")
-
-def main():
-
-    logging.info("1/10 📦 Starting extraction...")
-    extract_snapchat_data()
-    logging.info("✅ Extraction complete\n")
-    
-    logging.info("2/10 🧹 Removing unwanted file types...")
-    remove_unwanted_files()
-    logging.info("✅ Unwanted file removal complete\n")    
-
-    logging.info("3/10 🖼️  Removing thumbnails...")
-    remove_thumbnails()
-    logging.info("✅ Thumbnail removal complete\n")
-
-    logging.info("4/10 🔍 Finding and removing duplicates...")
-    remove_duplicates()
-    logging.info("✅ Duplicate removal complete\n")
-    
-    logging.info("5/10 🎤 Finding voice memos...")
-    find_voice_memos()
-    logging.info("✅ Voice memo detection complete\n")
-    
-    logging.info("6/10 📸 Processing image overlays...")
-    process_image_overlays()
-    logging.info("✅ Image overlay processing complete\n")
-    
-    logging.info("7/10 🎥 Processing video overlays...")
-    process_video_overlays()
-    logging.info("✅ Video overlay processing complete\n")
-
-    logging.info("8/10 📅 Updating file metadata from filenames...")
-    update_all_metadata()
-    logging.info("✅ Metadata update complete\n")
-
-    logging.info("9/10 🗑️  Cleaning up empty folders...")
-    remove_empty_folders()
-    logging.info("✅ Empty folder cleanup complete\n")
-
-    logging.info("10/10 📁 Reorganizing files into categories...")
-    reorganize_files()
-    logging.info("✅ File reorganization complete\n")
-    
-    print("\n✨ All operations completed successfully! ✨\n")
+            self.process_memories()
+            logging.info("Completed Snapchat data processing")
+        except Exception as e:
+            logging.error(f"Error in processing pipeline: {str(e)}")
+            raise
 
 if __name__ == "__main__":
-    main()
+    processor = SnapchatProcessor()
+    processor.process_all()
