@@ -766,6 +766,10 @@ def update_video_metadata(file_path):
         existing_date = None
         if 'format' in metadata and 'tags' in metadata['format'] and 'creation_time' in metadata['format']['tags']:
             try:
+                existing_date = datetime.strptime(metadata['format']['tags']['creation_time'], '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                pass
+                
         # Only update if creation_time not present
         if 'format' not in metadata or 'tags' not in metadata['format'] or 'creation_time' not in metadata['format']['tags']:
             # Create temporary file
