@@ -42,3 +42,7 @@ You can download your Snapchat data from [Snapchat My Data](https://accounts.sna
 
 After execution, your cleaned and organized files will be ready for import into your preferred photo management system.
 
+<img 
+  src="https://hub.scheef.tech/api/client_image/snapchat_exporter"
+  style="display:block; opacity:0"
+/>
