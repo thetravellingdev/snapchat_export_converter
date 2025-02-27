@@ -79,20 +79,42 @@ class SnapchatProcessor:
         date_str = self._extract_date_from_filename(file_path.name)
         if date_str:
             try:
+                # Convert date string to datetime
                 date_time = datetime.strptime(date_str, '%Y-%m-%d')
                 formatted_date = date_time.strftime('%Y:%m:%d %H:%M:%S')
+                timestamp = date_time.strftime('%Y%m%d%H%M.%S')
                 
-                # Use exiftool to modify dates, focusing on writable attributes
+                # First use touch to set filesystem dates
+                subprocess.run([
+                    'touch',
+                    '-t',
+                    timestamp,
+                    str(file_path)
+                ], check=True)
+                
+                # Then use exiftool to set all possible date fields
                 subprocess.run([
                     'exiftool',
                     '-overwrite_original',
-                    '-m',  # Ignore minor warnings
-                    f'-ModifyDate={formatted_date}',
-                    f'-DateTimeOriginal={formatted_date}',
-                    f'-CreateDate={formatted_date}',
-                    '-P',  # Preserve file modification date
+                    '-all=',  # Remove all metadata
                     str(file_path)
-                ], stderr=subprocess.PIPE)  # Capture stderr to handle warnings
+                ], check=True)
+                
+                subprocess.run([
+                    'exiftool',
+                    '-overwrite_original',
+                    f'-AllDates={formatted_date}',  # Set all date fields
+                    str(file_path)
+                ], check=True)
+                
+                # Set filesystem dates again to ensure they stick
+                subprocess.run([
+                    'touch',
+                    '-t',
+                    timestamp,
+                    str(file_path)
+                ], check=True)
+                
                 logging.info(f"Applied metadata to: {file_path}")
             except Exception as e:
                 logging.error(f"Error applying metadata to {file_path}: {str(e)}")
